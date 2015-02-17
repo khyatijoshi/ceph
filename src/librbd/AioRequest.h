@@ -192,8 +192,6 @@ namespace librbd {
     }
 
   private:
-    librados::IoCtx m_io_ctx;
-
     bool send_pre();
     bool send_post();
     void send_write();
@@ -249,15 +247,18 @@ namespace librbd {
   protected:
     virtual void add_write_ops(librados::ObjectWriteOperation *wr) {
       if (has_parent()) {
-	m_object_state = OBJECT_EXISTS;
 	wr->truncate(0);
       } else {
-	m_object_state = OBJECT_PENDING;
 	wr->remove();
       }
     }
 
     virtual void pre_object_map_update(uint8_t *new_state) {
+      if (has_parent()) {
+	m_object_state = OBJECT_EXISTS;
+      } else {
+	m_object_state = OBJECT_PENDING;
+      }
       *new_state = m_object_state;
     }
 

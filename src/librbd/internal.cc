@@ -69,11 +69,6 @@ namespace librbd {
     return image_name + RBD_SUFFIX;
   }
 
-  const string object_map_name(const string &image_id)
-  {
-    return RBD_OBJECT_MAP_PREFIX + image_id;
-  }
-
   int detect_format(IoCtx &io_ctx, const string &name,
 		    bool *old_format, uint64_t *size)
   {
@@ -315,13 +310,19 @@ namespace librbd {
       rollback_object(ictx, snap_id, ictx->get_object_name(i), throttle);
       prog_ctx.update_progress(i * bsize, numseg * bsize);
     }
-    rollback_object(ictx, snap_id, object_map_name(ictx->id), throttle);
 
     r = throttle.wait_for_ret();
     if (r < 0) {
       ldout(cct, 10) << "failed to rollback at least one object: "
 		     << cpp_strerror(r) << dendl;
       return r;
+    }
+
+    {
+      RWLock::RLocker l(ictx->md_lock);
+      if (ictx->object_map != NULL) {
+	ictx->object_map->rollback(snap_id);
+      }
     }
     return 0;
   }
@@ -478,11 +479,13 @@ namespace librbd {
     if (r < 0)
       return r;
 
+    bool lock_owner = false;
     while (ictx->image_watcher->is_lock_supported()) {
       r = prepare_image_update(ictx);
       if (r < 0) {
 	return -EROFS;
       } else if (ictx->image_watcher->is_lock_owner()) {
+	lock_owner = true;
 	break;
       }
 
@@ -493,13 +496,19 @@ namespace librbd {
       ldout(ictx->cct, 5) << "snap_create timed out notifying lock owner" << dendl;
     }
 
-    RWLock::RLocker l2(ictx->md_lock);
+    RWLock::WLocker l2(ictx->md_lock);
+    r = _flush(ictx);
+    if (r < 0) {
+      return r;
+    }
+
     do {
-      r = add_snap(ictx, snap_name);
+      r = add_snap(ictx, snap_name, lock_owner);
     } while (r == -ESTALE);
 
-    if (r < 0)
+    if (r < 0) {
       return r;
+    }
 
     if (notify) {
       notify_change(ictx->md_ctx, ictx->header_oid, ictx);
@@ -566,12 +575,20 @@ namespace librbd {
       }
     }
 
+    if (ictx->object_map != NULL) {
+      r = ictx->md_ctx.remove(ObjectMap::object_map_name(ictx->id, snap_id));
+      if (r < 0 && r != -ENOENT) {
+	lderr(ictx->cct) << "snap_remove: failed to remove snapshot object map"
+			 << dendl;
+	return 0;
+      }
+    }
+
     r = rm_snap(ictx, snap_name);
     if (r < 0)
       return r;
 
     r = ictx->data_ctx.selfmanaged_snap_remove(snap_id);
-
     if (r < 0)
       return r;
 
@@ -886,7 +903,7 @@ reprotect_and_return_err:
       librados::ObjectWriteOperation op;
       cls_client::object_map_resize(&op, Striper::get_num_objects(layout, size),
                                     OBJECT_NONEXISTENT);
-      r = io_ctx.operate(object_map_name(id), &op);
+      r = io_ctx.operate(ObjectMap::object_map_name(id, CEPH_NOSNAP), &op);
       if (r < 0) {
         goto err_remove_header;
       }
@@ -1452,6 +1469,18 @@ reprotect_and_return_err:
     return 0;
   }
 
+  int get_flags(ImageCtx *ictx, uint64_t *flags)
+  {
+    int r = ictx_check(ictx);
+    if (r < 0) {
+      return r;
+    }
+
+    RWLock::RLocker l(ictx->md_lock);
+    RWLock::RLocker l2(ictx->snap_lock);
+    return ictx->get_flags(ictx->snap_id, flags);
+  }
+
   int is_exclusive_lock_owner(ImageCtx *ictx, bool *is_owner)
   {
     RWLock::RLocker l(ictx->owner_lock);
@@ -1552,7 +1581,7 @@ reprotect_and_return_err:
       }
     }
     if (!old_format) {
-      r = io_ctx.remove(object_map_name(id));
+      r = io_ctx.remove(ObjectMap::object_map_name(id, CEPH_NOSNAP));
       if (r < 0 && r != -ENOENT) {
 	lderr(cct) << "error removing image object map" << dendl;
       }
@@ -1589,6 +1618,7 @@ reprotect_and_return_err:
     ldout(cct, 20) << "resize " << ictx << " " << ictx->size << " -> "
 		   << size << dendl;
 
+    uint64_t request_id = ictx->async_request_seq.inc();
     int r;
     do {
       C_SaferCond *ctx;
@@ -1602,7 +1632,7 @@ reprotect_and_return_err:
 	    break;
 	  }
 
-	  r = ictx->image_watcher->notify_resize(size, prog_ctx);
+	  r = ictx->image_watcher->notify_resize(request_id, size, prog_ctx);
 	  if (r != -ETIMEDOUT && r != -ERESTART) {
 	    return r;
 	  }
@@ -1653,7 +1683,7 @@ reprotect_and_return_err:
       RWLock::RLocker l(ictx->md_lock);
       original_size = ictx->size;
       if (size < ictx->size) {
-	ictx->wait_for_pending_copyup();
+	ictx->flush_async_operations();
 	if (ictx->object_cacher) {
 	  // need to invalidate since we're deleting objects, and
 	  // ObjectCacher doesn't track non-existent objects
@@ -1713,9 +1743,10 @@ reprotect_and_return_err:
   }
 
 
-  int add_snap(ImageCtx *ictx, const char *snap_name)
+  int add_snap(ImageCtx *ictx, const char *snap_name, bool lock_owner)
   {
     assert(ictx->owner_lock.is_locked());
+    assert(ictx->md_lock.is_wlocked());
     uint64_t snap_id;
 
     int r = ictx->md_ctx.selfmanaged_snap_create(&snap_id);
@@ -1744,6 +1775,24 @@ reprotect_and_return_err:
       return r;
     }
 
+    if (!ictx->old_format) {
+      if (ictx->object_map != NULL) {
+	ictx->object_map->snapshot(snap_id);
+      }
+      if (lock_owner) {
+	// immediately start using the new snap context if we
+	// own the exclusive lock
+	std::vector<snapid_t> snaps;
+	snaps.push_back(snap_id);
+	snaps.insert(snaps.end(), ictx->snapc.snaps.begin(),
+		     ictx->snapc.snaps.end());
+
+	ictx->snapc.seq = snap_id;
+	ictx->snapc.snaps.swap(snaps);
+	ictx->data_ctx.selfmanaged_snap_set_write_ctx(ictx->snapc.seq,
+						      ictx->snaps);
+      }
+    }
     return 0;
   }
 
@@ -1777,16 +1826,6 @@ reprotect_and_return_err:
     ictx->refresh_lock.Lock();
     bool needs_refresh = ictx->last_refresh != ictx->refresh_seq;
     ictx->refresh_lock.Unlock();
-
-    if (ictx->image_watcher != NULL) {
-      // might have encountered an error re-registering a watch
-      int r = ictx->image_watcher->get_watch_error();
-      if (r < 0) {
-        lderr(cct) << "rbd header watch invalid: " << cpp_strerror(r)
-                   << dendl;
-	return r;
-      }
-    }
 
     if (needs_refresh) {
       RWLock::WLocker l(ictx->md_lock);
@@ -1851,6 +1890,7 @@ reprotect_and_return_err:
     vector<uint64_t> snap_features;
     vector<parent_info> snap_parents;
     vector<uint8_t> snap_protection;
+    vector<uint64_t> snap_flags;
     {
       int r;
       RWLock::WLocker l(ictx->snap_lock);
@@ -1918,31 +1958,33 @@ reprotect_and_return_err:
 	      return -ENOSYS;
 	    }
 
-            r = cls_client::get_flags(&ictx->md_ctx, ictx->header_oid,
-                                      ictx->snap_id, &ictx->flags);
+	    r = cls_client::get_flags(&ictx->md_ctx, ictx->header_oid,
+				      &ictx->flags, new_snapc.snaps,
+				      &snap_flags);
             if (r == -EOPNOTSUPP || r == -EIO) {
               // Older OSD doesn't support RBD flags, need to assume the worst
               ldout(ictx->cct, 10) << "OSD does not support RBD flags" << dendl;
-            } else if (r == -ENOENT) {
-              ldout(ictx->cct, 10) << "Image at invalid snapshot" << dendl;
-            } else if (r < 0 && r != -ENOENT) {
-              lderr(cct) << "Error reading flags: " << cpp_strerror(r) << dendl;
-              return r;
-            }
-            if (r < 0) {
               ictx->flags = 0;
               if ((ictx->features & RBD_FEATURE_OBJECT_MAP) != 0) {
                 ldout(ictx->cct, 10) << "disabling object map optimizations"
                                      << dendl;
                 ictx->flags |= RBD_FLAG_OBJECT_MAP_INVALID;
               }
+
+	      vector<uint64_t> default_flags(new_snapc.snaps.size(), ictx->flags);
+	      snap_flags.swap(default_flags);
+            } else if (r == -ENOENT) {
+              ldout(ictx->cct, 10) << "Image at invalid snapshot" << dendl;
+	      continue;
+            } else if (r < 0) {
+              lderr(cct) << "Error reading flags: " << cpp_strerror(r) << dendl;
+              return r;
             }
 
 	    r = cls_client::snapshot_list(&(ictx->md_ctx), ictx->header_oid,
 					  new_snapc.snaps, &snap_names,
 					  &snap_sizes, &snap_features,
-					  &snap_parents,
-					  &snap_protection);
+					  &snap_parents, &snap_protection);
 	    // -ENOENT here means we raced with snapshot deletion
 	    if (r < 0 && r != -ENOENT) {
 	      lderr(ictx->cct) << "snapc = " << new_snapc << dendl;
@@ -1975,13 +2017,14 @@ reprotect_and_return_err:
 	ictx->snap_ids.clear();
 	for (size_t i = 0; i < new_snapc.snaps.size(); ++i) {
 	  uint64_t features = ictx->old_format ? 0 : snap_features[i];
+	  uint64_t flags = ictx->old_format ? 0 : snap_flags[i];
 	  uint8_t protection_status = ictx->old_format ?
 	    (uint8_t)RBD_PROTECTION_STATUS_UNPROTECTED : snap_protection[i];
 	  parent_info parent;
 	  if (!ictx->old_format)
 	    parent = snap_parents[i];
-	  ictx->add_snap(snap_names[i], new_snapc.snaps[i].val,
-			 snap_sizes[i], features, parent, protection_status);
+	  ictx->add_snap(snap_names[i], new_snapc.snaps[i].val, snap_sizes[i],
+			 features, parent, protection_status, flags);
 	}
 
 	r = refresh_parent(ictx);
@@ -2009,7 +2052,7 @@ reprotect_and_return_err:
       } else {
 	ictx->object_map = new ObjectMap(*ictx);
 	if (ictx->snap_exists) {
-	  ictx->object_map->refresh();
+	  ictx->object_map->refresh(ictx->snap_id);
 	}
       }
 
@@ -2281,10 +2324,6 @@ reprotect_and_return_err:
     if (r < 0) {
       return r;
     }
-
-    if (ictx->object_map != NULL) {
-      ictx->object_map->refresh();
-    }
     refresh_parent(ictx);
     return 0;
   }
@@ -2297,10 +2336,7 @@ reprotect_and_return_err:
     // ignore return value, since we may be set to a non-existent
     // snapshot and the user is trying to fix that
     ictx_check(ictx);
-    ictx->wait_for_pending_copyup();
-    if (ictx->image_watcher != NULL) {
-      ictx->image_watcher->flush_aio_operations();
-    }
+    ictx->flush_async_operations();
     if (ictx->object_cacher) {
       // complete pending writes before we're set to a snapshot and
       // get -EROFS for writes
@@ -2367,9 +2403,6 @@ reprotect_and_return_err:
     ldout(ictx->cct, 20) << "close_image " << ictx << dendl;
 
     ictx->readahead.wait_for_pending();
-    if (ictx->image_watcher != NULL) {
-      ictx->image_watcher->flush_aio_operations();
-    }
     if (ictx->object_cacher) {
       ictx->shutdown_cache(); // implicitly flushes
     } else {
@@ -2380,7 +2413,6 @@ reprotect_and_return_err:
       ictx->copyup_finisher->wait_for_empty();
       ictx->copyup_finisher->stop();
     }
-    ictx->wait_for_pending_copyup();
 
     if (ictx->parent) {
       close_image(ictx->parent);
@@ -2414,6 +2446,7 @@ reprotect_and_return_err:
       return -EROFS;
     }
 
+    uint64_t request_id = ictx->async_request_seq.inc();
     int r;
     do {
       C_SaferCond *ctx;
@@ -2427,7 +2460,7 @@ reprotect_and_return_err:
 	    break;
 	  }
 
-          r = ictx->image_watcher->notify_flatten(prog_ctx);
+          r = ictx->image_watcher->notify_flatten(request_id, prog_ctx);
           if (r != -ETIMEDOUT && r != -ERESTART) {
             return r;
           }
@@ -2602,7 +2635,46 @@ reprotect_and_return_err:
 		       << "'" << dendl;
       return -EINVAL;
     }
-    RWLock::RLocker locker(ictx->md_lock);
+
+    md_config_t *conf = ictx->cct->_conf;
+    if (conf->rbd_blacklist_on_break_lock) {
+      typedef std::map<rados::cls::lock::locker_id_t,
+		       rados::cls::lock::locker_info_t> Lockers;
+      Lockers lockers;
+      ClsLockType lock_type;
+      std::string lock_tag;
+      r = rados::cls::lock::get_lock_info(&ictx->md_ctx, ictx->header_oid,
+                                          RBD_LOCK_NAME, &lockers, &lock_type,
+                                          &lock_tag);
+      if (r < 0) {
+        lderr(ictx->cct) << "unable to retrieve lock info: " << cpp_strerror(r)
+          	       << dendl;
+        return r;
+      }
+
+      std::string client_address;
+      for (Lockers::iterator it = lockers.begin();
+           it != lockers.end(); ++it) {
+        if (it->first.locker == lock_client) {
+          client_address = stringify(it->second.addr);
+          break;
+        }
+      }
+      if (client_address.empty()) {
+        return -ENOENT;
+      }
+      
+      RWLock::RLocker locker(ictx->md_lock);
+      librados::Rados rados(ictx->md_ctx);
+      r = rados.blacklist_add(client_address,
+			      conf->rbd_blacklist_expire_seconds);
+      if (r < 0) {
+        lderr(ictx->cct) << "unable to blacklist client: " << cpp_strerror(r)
+          	       << dendl;
+        return r;
+      }
+    }
+
     r = rados::cls::lock::break_lock(&ictx->md_ctx, ictx->header_oid,
 				     RBD_LOCK_NAME, cookie, lock_client);
     if (r < 0)
@@ -3097,15 +3169,17 @@ reprotect_and_return_err:
       return r;
     }
 
-    if (ictx->image_watcher != NULL) {
-      ictx->image_watcher->flush_aio_operations();
-    }
     ictx->user_flushed();
 
     c->get();
+
+    C_AioWrite *flush_ctx = new C_AioWrite(cct, c);
     c->add_request();
+    ictx->flush_async_operations(flush_ctx);
+
     c->init_time(ictx, AIO_TYPE_FLUSH);
     C_AioWrite *req_comp = new C_AioWrite(cct, c);
+    c->add_request();
     if (ictx->object_cacher) {
       ictx->flush_cache_aio(req_comp);
     } else {
@@ -3139,10 +3213,6 @@ reprotect_and_return_err:
 
   int _flush(ImageCtx *ictx)
   {
-    if (ictx->image_watcher != NULL) {
-      ictx->image_watcher->flush_aio_operations();
-    }
-
     CephContext *cct = ictx->cct;
     int r;
     // flush any outstanding writes
@@ -3150,7 +3220,7 @@ reprotect_and_return_err:
       r = ictx->flush_cache();
     } else {
       r = ictx->data_ctx.aio_flush();
-      ictx->wait_for_pending_aio();
+      ictx->flush_async_operations();
     }
 
     if (r)
@@ -3169,9 +3239,7 @@ reprotect_and_return_err:
       return r;
     }
 
-    if (ictx->image_watcher != NULL) {
-      ictx->image_watcher->flush_aio_operations();
-    }
+    ictx->flush_async_operations();
 
     RWLock::WLocker l(ictx->md_lock);
     r = ictx->invalidate_cache();
@@ -3196,6 +3264,9 @@ reprotect_and_return_err:
       return r;
     }
 
+    RWLock::RLocker owner_locker(ictx->owner_lock);
+    RWLock::RLocker md_locker(ictx->md_lock);
+
     ictx->snap_lock.get_read();
     snapid_t snap_id = ictx->snap_id;
     ::SnapContext snapc = ictx->snapc;
@@ -3214,7 +3285,6 @@ reprotect_and_return_err:
     c->get();
     c->init_time(ictx, AIO_TYPE_WRITE);
 
-    RWLock::RLocker l(ictx->owner_lock);
     if (ictx->image_watcher->is_lock_supported() &&
 	!ictx->image_watcher->is_lock_owner()) {
       c->put();
@@ -3290,6 +3360,9 @@ reprotect_and_return_err:
       return r;
     }
 
+    RWLock::RLocker owner_locker(ictx->owner_lock);
+    RWLock::RLocker md_locker(ictx->md_lock);
+
     // TODO: check for snap
     ictx->snap_lock.get_read();
     snapid_t snap_id = ictx->snap_id;
@@ -3307,7 +3380,6 @@ reprotect_and_return_err:
     c->get();
     c->init_time(ictx, AIO_TYPE_DISCARD);
 
-    RWLock::RLocker l(ictx->owner_lock);
     if (ictx->image_watcher->is_lock_supported() &&
 	!ictx->image_watcher->is_lock_owner()) {
       c->put();
